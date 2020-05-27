@@ -1,5 +1,4 @@
 # Regular python libraries
-from utils_cv.similarity.model import compute_features, compute_feature, compute_features_learner
 from utils_cv.similarity.metrics import compute_distances, vector_distance
 from utils_cv.similarity.data import Urls
 from utils_cv.common.gpu import which_processor, db_num_workers
@@ -17,6 +16,8 @@ from IPython.core.debugger import set_trace
 from PIL import ImageOps, Image
 import cv2
 from typing import List
+from torch.nn import Module
+from torch import Tensor
 
 from fastapi import FastAPI, File, UploadFile, Body
 from starlette.responses import HTMLResponse, StreamingResponse
@@ -41,8 +42,31 @@ from fastai.vision import (
 import io
 
 
-# Computer Vision repository
-sys.path.extend([".", "../.."])  # to access the utils_cv library
+class SaveFeatures:
+    """Hook to save the features in the intermediate layers
+
+    Source: https://forums.fast.ai/t/how-to-find-similar-images-based-on-final-embedding-layer/16903/13
+
+    Args:
+        model_layer (nn.Module): Model layer
+
+    """
+
+    features = None
+
+    def __init__(self, model_layer: Module):
+        self.hook = model_layer.register_forward_hook(self.hook_fn)
+        self.features = None
+
+    def hook_fn(self, module: Module, input: Tensor, output: Tensor):
+        out = output.detach().cpu().numpy()
+        if isinstance(self.features, type(None)):
+            self.features = out
+        else:
+            self.features = np.row_stack((self.features, out))
+
+    def remove(self):
+        self.hook.remove()
 
 
 class EmbeddedFeatureWrapper(nn.Module):
@@ -118,6 +142,7 @@ similarity_learn = load_learner(
 classify_learn = load_learner(
     config['sig_config']['model_path'], config['sig_config']['classify_model_name'])
 embedding_layer = similarity_learn.model[1][-2]
+featurizer = SaveFeatures(embedding_layer)
 
 
 def extract_signature(file, device):
@@ -125,7 +150,8 @@ def extract_signature(file, device):
     offset = device and config['sig_config']['device'] or config['sig_config']['app']
     pages = convert_from_bytes(file.read())
     for page in pages:
-        page = page.crop((offset['start_width'], offset['start_height'], offset['end_width'], offset['end_height']))
+        page = page.crop((offset['start_width'], offset['start_height'],
+                          offset['end_width'], offset['end_height']))
         return page
 
 
@@ -181,10 +207,18 @@ def compare_sig(app_img, device_img):
     if(app_img and device_img):
         if(config['sig_config']['similarity_response'][signature_class_1] != config['sig_config']['success_case']
            and config['sig_config']['similarity_response'][signature_class_2] != config['sig_config']['success_case']):
-            result = config['sig_config']['similarity_response'][signature_class_1] if config['sig_config']['similarity_response'][signature_class_1] != config['sig_config']['success_case'] else config['sig_config']['similarity_response'][signature_class_2]
+            result = config['sig_config']['similarity_response'][signature_class_1] if config['sig_config']['similarity_response'][
+                signature_class_1] != config['sig_config']['success_case'] else config['sig_config']['similarity_response'][signature_class_2]
         if(result == ""):
-            app_emb = compute_feature(app_img, similarity_learn, embedding_layer)
-            device_emb = compute_feature(device_img, similarity_learn, embedding_layer)
+            featurizer.features = None
+            similarity_learn.predict(app_img)
+            app_emb = featurizer.features[0][:]
+            assert len(app_emb) > 1
+            featurizer.features = None
+            similarity_learn.predict(device_img)
+            device_emb = featurizer.features[0][:]
+            assert len(device_emb) > 1
+            featurizer.features = None
             similarity_score = vector_distance(app_emb, device_emb)
             if similarity_score <= config['sig_config']['accept_threshold']:
                 result = config['sig_config']['success_case']
@@ -193,7 +227,8 @@ def compare_sig(app_img, device_img):
             else:
                 result = config['sig_config']['unknown_case']
     elif app_img or device_img:
-        result = app_img and config['sig_config']['similarity_response'][signature_class_1] or config['sig_config']['similarity_response'][signature_class_2]
+        result = app_img and config['sig_config']['similarity_response'][
+            signature_class_1] or config['sig_config']['similarity_response'][signature_class_2]
     else:
         return {"status": "error", 'description': "no files"}
     print("compare signature  --- %s seconds ---" % (time.time() - start_time))
@@ -210,7 +245,10 @@ async def signature_compute(app: UploadFile = File(...), device: UploadFile = Fi
         device_img = open_image(device.file)
     except:
         device_img = None
-    return compare_sig(app_img, device_img)
+    result = compare_sig(app_img, device_img)
+    app.file.close()
+    device.file.close()
+    return result
 
 
 @app.post("/compare_signature_pdf/")
@@ -229,7 +267,10 @@ async def signature_compute(app: UploadFile = File(...), device: UploadFile = Fi
         device_img = open_image(io.BytesIO(im_png.tobytes()))
     except:
         device_img = None
-    return compare_sig(app_img, device_img)
+    result = compare_sig(app_img, device_img)
+    app.file.close()
+    device.file.close()
+    return result
 
 
 @app.post("/check_signature/")
@@ -238,7 +279,9 @@ async def signature_compute(file: UploadFile = File(...)):
     device_img = open_image(file.file)
     classify_result = classify_learn.predict(device_img)
     signature_class = classify_result[1]
-    print("classify signature  --- %s seconds ---" % (time.time() - start_time))
+    print("classify signature  --- %s seconds ---" %
+          (time.time() - start_time))
+    file.file.close()
 
     return {"status": config['sig_config']['classify_response'][str(signature_class.item())]}
 
@@ -252,6 +295,7 @@ def image_endpoint(device: int = Body(...), file: UploadFile = File(...)):
     else:
         device = False
     ex_sig = extract_signature(file.file, device)
+    file.file.close()
     vector = center_image(ex_sig)
     cv2img = np.array(vector)
     res, im_png = cv2.imencode(".jpg", cv2img)

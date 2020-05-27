@@ -1,7 +1,3 @@
-# This config is tuned for the bundle of person-detection-retail-xxx and person-reidentification-retail-xxx
-# models, but should be suitable for other well-trained detector and reid models
-# Alse all tracking update intervals are set assumin input frequency about 30FPS
-
 sig_config = dict(
     accept_threshold=1.2,
     deny_threshold=1.6,
